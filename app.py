@@ -1,15 +1,16 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
 import joblib
 import pandas as pd
 import numpy as np
-from typing import List
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-import redis.asyncio as redis
-from fastapi.responses import JSONResponse
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.callbacks import EarlyStopping
+import io
+import os
 
 # Initialize FastAPI app
 app = FastAPI(title="Fraud Detection API")
@@ -22,14 +23,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Initialize rate limiter
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(429, _rate_limit_exceeded_handler)
-
-# Initialize Redis for caching
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 # Load the saved model and scaler
 model = tf.keras.models.load_model('fraud_detection_model.keras')
@@ -50,47 +43,14 @@ numeric_cols = ['step', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalance
 
 # Root endpoint
 @app.get("/")
-async def read_root():
+def read_root():
     return {"message": "Welcome to the Fraud Detection API. Use /docs for API documentation."}
 
-# Batch prediction endpoint
-@app.post("/predict/batch")
-@limiter.limit("100/minute")  # Adjust rate limit as needed
-async def predict_fraud_batch(request: Request, transactions: List[Transaction]):
-    try:
-        # Convert list of transactions to DataFrame
-        input_data = [t.dict() for t in transactions]
-        user_input = pd.DataFrame(input_data, columns=['step', 'type', 'amount', 'oldbalanceOrg', 
-                                                       'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest'])
-
-        # Scale numeric columns
-        user_input[numeric_cols] = scaler.transform(user_input[numeric_cols])
-
-        # Make batch prediction
-        predictions = (model.predict(user_input) > 0.5).astype("int32").flatten()
-        results = ["Fraud" if pred == 1 else "No Fraud" for pred in predictions]
-
-        # Cache results for identical transactions
-        for transaction, result in zip(input_data, results):
-            transaction_key = str(transaction)  # Use transaction dict as cache key
-            await redis_client.setex(transaction_key, 3600, result)  # Cache for 1 hour
-
-        return {"predictions": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
-
-# Single prediction endpoint with caching
+# POST endpoint for fraud prediction
 @app.post("/predict")
-@limiter.limit("100/minute")
-async def predict_fraud(request: Request, transaction: Transaction):
+def predict_fraud(transaction: Transaction):
     try:
-        # Check cache first
-        transaction_key = str(transaction.dict())
-        cached_result = await redis_client.get(transaction_key)
-        if cached_result:
-            return {"prediction": cached_result}
-
-        # Convert input data to DataFrame
+        # Convert input data to dictionary and then to DataFrame
         input_data = transaction.dict()
         user_input = pd.DataFrame([input_data], columns=['step', 'type', 'amount', 'oldbalanceOrg', 
                                                          'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest'])
@@ -100,21 +60,86 @@ async def predict_fraud(request: Request, transaction: Transaction):
 
         # Make prediction
         prediction = (model.predict(user_input) > 0.5).astype("int32")[0, 0]
+
+        # Return result
         result = "Fraud" if prediction == 1 else "No Fraud"
-
-        # Cache the result
-        await redis_client.setex(transaction_key, 3600, result)  # Cache for 1 hour
-
         return {"prediction": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-# Shutdown event to close Redis connection
-@app.on_event("shutdown")
-async def shutdown_event():
-    await redis_client.close()
+# POST endpoint for retraining the model
+@app.post("/retrain")
+async def retrain_model(file: UploadFile = File(...)):
+    try:
+        # Read the uploaded CSV file
+        contents = await file.read()
+        new_data = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Verify required columns are present
+        required_columns = ['step', 'type', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 
+                          'oldbalanceDest', 'newbalanceDest', 'isFraud']
+        if not all(col in new_data.columns for col in required_columns):
+            raise HTTPException(status_code=400, detail="Missing required columns in CSV file")
+
+        # Preprocess the data similar to notebook
+        # Drop unnecessary columns if they exist
+        columns_to_drop = ['nameOrig', 'nameDest', 'isFlaggedFraud']
+        new_data = new_data.drop(columns=[col for col in columns_to_drop if col in new_data.columns])
+
+        # Encode 'type' column if it's still categorical
+        if new_data['type'].dtype == 'object':
+            le = LabelEncoder()
+            new_data['type'] = le.fit_transform(new_data['type'])
+
+        # Prepare features and target
+        X = new_data.drop('isFraud', axis=1)
+        y = new_data['isFraud']
+
+        # Scale numeric features
+        X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
+
+        # Split the data (70% train, 15% val, 15% test)
+        X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+        X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+        # Compute class weights
+        class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
+        class_weight_dict = {0: class_weights[0], 1: class_weights[1]}
+
+        # Define Early Stopping
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+        # Retrain the model
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=50,
+            batch_size=32,
+            class_weight=class_weight_dict,
+            callbacks=[early_stopping],
+            verbose=0
+        )
+
+        # Evaluate on test set
+        y_pred = (model.predict(X_test) > 0.5).astype("int32")
+        accuracy = float(np.mean(y_pred.flatten() == y_test.values))
+
+        # Save the updated model and scaler
+        model.save('fraud_detection_model.keras')
+        joblib.dump(scaler, 'standard_scaler.pkl')
+
+        return {
+            "message": "Model retrained successfully",
+            "test_accuracy": accuracy,
+            "training_epochs": len(history.history['loss'])
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during retraining: {str(e)}")
+    finally:
+        await file.close()
 
 # Run the app with: uvicorn app:app --reload
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
