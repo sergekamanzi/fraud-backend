@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
@@ -12,16 +13,17 @@ from tensorflow.keras.callbacks import EarlyStopping
 import io
 import os
 
+
 # Initialize FastAPI app
 app = FastAPI(title="Fraud Detection API")
 
 # Add CORS middleware to allow access from any origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
 )
 
 # Load the saved model and scaler
@@ -38,7 +40,7 @@ class Transaction(BaseModel):
     oldbalanceDest: float
     newbalanceDest: float
 
-# Define numeric columns for scaling
+# Define numeric columns for scaling (same as in your Colab)
 numeric_cols = ['step', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest']
 
 # Root endpoint
@@ -66,6 +68,7 @@ def predict_fraud(transaction: Transaction):
         return {"prediction": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
 
 # POST endpoint for retraining the model
 @app.post("/retrain")
@@ -138,8 +141,11 @@ async def retrain_model(file: UploadFile = File(...)):
     finally:
         await file.close()
 
+
 # Run the app with: uvicorn app:app --reload
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
