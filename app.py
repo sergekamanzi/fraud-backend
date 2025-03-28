@@ -8,7 +8,11 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
 from sklearn.metrics import confusion_matrix
 import io
 import os
@@ -33,9 +37,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the saved model and scaler
-model = tf.keras.models.load_model('fraud_detection_model.keras')
-scaler = joblib.load('standard_scaler.pkl')
+# Load the saved model and scaler if they exist, otherwise create a new model
+try:
+    model = tf.keras.models.load_model('fraud_detection_model.keras')
+    scaler = joblib.load('standard_scaler.pkl')
+except:
+    # Define a simpler model if it doesn't exist
+    model = Sequential([
+        Dense(32, activation='relu', kernel_regularizer=l2(0.05), input_shape=(6,)),  # Reduced neurons, increased regularization
+        Dropout(0.3),  # Added dropout to prevent overfitting
+        Dense(16, activation='relu', kernel_regularizer=l2(0.05)),  # Reduced neurons
+        Dropout(0.3),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+    scaler = None  # Will be created during retraining
 
 # Define the input data schema using Pydantic
 class Transaction(BaseModel):
@@ -68,6 +84,7 @@ def read_root():
 # POST endpoint for fraud prediction
 @app.post("/predict")
 def predict_fraud(transaction: Transaction):
+    global scaler
     try:
         # Convert input data to dictionary and then to DataFrame
         input_data = transaction.dict()
@@ -75,6 +92,8 @@ def predict_fraud(transaction: Transaction):
                                                          'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest'])
 
         # Scale numeric columns
+        if scaler is None:
+            raise HTTPException(status_code=500, detail="Scaler not initialized. Please retrain the model first.")
         user_input[numeric_cols] = scaler.transform(user_input[numeric_cols])
 
         # Make prediction
@@ -89,6 +108,7 @@ def predict_fraud(transaction: Transaction):
 # POST endpoint for retraining the model
 @app.post("/retrain")
 async def retrain_model(file: UploadFile = File(...)):
+    global scaler
     try:
         # Read the uploaded CSV file
         contents = await file.read()
@@ -123,24 +143,36 @@ async def retrain_model(file: UploadFile = File(...)):
         y = new_data['isFraud']
 
         # Scale numeric features
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
         X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
 
-        # Split the data (70% train, 15% val, 15% test)
-        X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+        # Split the data (60% train, 20% val, 20% test) - increased test set size
+        X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
         X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
 
-        # Compute class weights
+        # Compute class weights with a slight adjustment to reduce emphasis on minority class
         class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
-        class_weight_dict = {0: class_weights[0], 1: class_weights[1]}
+        class_weight_dict = {0: class_weights[0] * 0.8, 1: class_weights[1] * 0.8}  # Reduced weight impact
 
         # Define Early Stopping
         early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-        # Retrain the model
+        # Define a simpler model
+        model = Sequential([
+            Dense(32, activation='relu', kernel_regularizer=l2(0.05), input_shape=(X_train.shape[1],)),
+            Dropout(0.3),
+            Dense(16, activation='relu', kernel_regularizer=l2(0.05)),
+            Dropout(0.3),
+            Dense(1, activation='sigmoid')
+        ])
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+
+        # Retrain the model with fewer epochs
         history = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
-            epochs=50,
+            epochs=20,  # Reduced epochs
             batch_size=32,
             class_weight=class_weight_dict,
             callbacks=[early_stopping],
