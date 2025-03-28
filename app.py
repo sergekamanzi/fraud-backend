@@ -9,8 +9,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import confusion_matrix
 import io
 import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import base64
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(title="Fraud Detection API")
@@ -18,10 +27,10 @@ app = FastAPI(title="Fraud Detection API")
 # Add CORS middleware to allow access from any origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Load the saved model and scaler
@@ -38,8 +47,18 @@ class Transaction(BaseModel):
     oldbalanceDest: float
     newbalanceDest: float
 
-# Define numeric columns for scaling (same as in your Colab)
+# Define numeric columns for scaling
 numeric_cols = ['step', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest']
+
+# Helper function to convert plot to base64 string
+def plot_to_base64():
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close()
+    logger.info("Generated base64 image string of length: %d", len(image_base64))
+    return image_base64
 
 # Root endpoint
 @app.get("/")
@@ -91,6 +110,14 @@ async def retrain_model(file: UploadFile = File(...)):
             le = LabelEncoder()
             new_data['type'] = le.fit_transform(new_data['type'])
 
+        # Generate correlation heatmap (excluding target column)
+        corr_matrix = new_data.drop(columns=['isFraud']).corr()
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt='.2f', linewidths=0.5)
+        plt.title('Correlation Heatmap (Without Target Columns)')
+        correlation_heatmap = plot_to_base64()
+        logger.info("Correlation heatmap generated")
+
         # Prepare features and target
         X = new_data.drop('isFraud', axis=1)
         y = new_data['isFraud']
@@ -124,6 +151,18 @@ async def retrain_model(file: UploadFile = File(...)):
         y_pred = (model.predict(X_test) > 0.5).astype("int32")
         accuracy = float(np.mean(y_pred.flatten() == y_test.values))
 
+        # Compute confusion matrix
+        conf_matrix = confusion_matrix(y_test, y_pred)
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['Predicted Negative', 'Predicted Positive'],
+                    yticklabels=['Actual Negative', 'Actual Positive'])
+        plt.title('Confusion Matrix')
+        plt.ylabel('Actual')
+        plt.xlabel('Predicted')
+        confusion_matrix_plot = plot_to_base64()
+        logger.info("Confusion matrix generated")
+
         # Format the accuracy to 6 decimal places
         formatted_accuracy = round(accuracy, 6)
 
@@ -131,12 +170,18 @@ async def retrain_model(file: UploadFile = File(...)):
         model.save('fraud_detection_model.keras')
         joblib.dump(scaler, 'standard_scaler.pkl')
 
-        return {
+        # Log the response being sent
+        response = {
             "message": "Model retrained successfully",
             "test_accuracy": formatted_accuracy,
-            "training_epochs": len(history.history['loss'])
+            "training_epochs": len(history.history['loss']),
+            "correlation_heatmap": f"data:image/png;base64,{correlation_heatmap}",
+            "confusion_matrix": f"data:image/png;base64,{confusion_matrix_plot}"
         }
+        logger.info("Sending response: %s", response.keys())
+        return response
     except Exception as e:
+        logger.error("Error during retraining: %s", str(e))
         raise HTTPException(status_code=500, detail=f"Error during retraining: {str(e)}")
     finally:
         await file.close()
